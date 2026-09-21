@@ -11,6 +11,7 @@ import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.Uri
 import android.os.Build
 import android.os.IBinder
 import android.util.Base64
@@ -33,7 +34,6 @@ class NtfyForegroundService : Service() {
 
     @Volatile private var networkAvailable = false
     @Volatile private var activeConnection: HttpURLConnection? = null
-    @Volatile private var worker: Thread? = null
     @Volatile private var generation = 0L
     @Volatile private var networkGeneration = 0L
     @Volatile private var currentConfig: NtfyConfig? = null
@@ -78,11 +78,15 @@ class NtfyForegroundService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        generation += 1
+        val previous = synchronized(networkMonitor) {
+            generation += 1
+            val old = activeConnection
+            activeConnection = null
+            networkMonitor.notifyAll()
+            old
+        }
+        previous?.disconnect()
         ntfyServiceRuntime.markStopped()
-        activeConnection?.disconnect()
-        activeConnection = null
-        synchronized(networkMonitor) { networkMonitor.notifyAll() }
         runCatching { connectivityManager.unregisterNetworkCallback(networkCallback) }
         val status = statusJson("stopped", running = false, connected = false)
         store.saveStatus(status)
@@ -91,11 +95,15 @@ class NtfyForegroundService : Service() {
     }
 
     private fun startConnection(config: NtfyConfig) {
-        generation += 1
-        val runId = generation
-        activeConnection?.disconnect()
-        synchronized(networkMonitor) { networkMonitor.notifyAll() }
-        worker = Thread({ connectionLoop(config, runId) }, "capacitor-ntfy-stream").apply {
+        val (runId, previous) = synchronized(networkMonitor) {
+            generation += 1
+            val old = activeConnection
+            activeConnection = null
+            networkMonitor.notifyAll()
+            generation to old
+        }
+        previous?.disconnect()
+        Thread({ connectionLoop(config, runId) }, "capacitor-ntfy-stream").apply {
             isDaemon = true
             start()
         }
@@ -138,9 +146,6 @@ class NtfyForegroundService : Service() {
                 )
                 val jitter = ThreadLocalRandom.current().nextLong(0, 1_000)
                 waitForSignal(retrySeconds * 1_000L + jitter)
-            } finally {
-                activeConnection?.disconnect()
-                activeConnection = null
             }
         }
     }
@@ -159,25 +164,42 @@ class NtfyForegroundService : Service() {
             setRequestProperty("User-Agent", "capacitor-ntfy/0.1 Android")
             setAuthorization(config)
         }
-        activeConnection = connection
-        val responseCode = connection.responseCode
-        if (responseCode !in 200..299) {
-            val detail = connection.errorStream?.bufferedReader()?.use { it.readText().take(300) }
-            throw IOException("ntfy HTTP $responseCode${detail?.let { ": $it" } ?: ""}")
-        }
+        try {
+            synchronized(networkMonitor) {
+                if (!isActive(runId)) return
+                activeConnection = connection
+            }
+            val responseCode = connection.responseCode
+            if (responseCode !in 200..299) throw IOException("ntfy HTTP $responseCode")
 
-        onConnected()
-        emitStatus("connected", true, null, null, runId)
-        BufferedReader(InputStreamReader(connection.inputStream, Charsets.UTF_8)).use { reader ->
-            while (isActive(runId)) {
-                val line = reader.readLine() ?: break
-                if (line.isBlank()) continue
-                val raw = JSONObject(line)
-                when (raw.optString("event")) {
-                    "open" -> emitStatus("connected", true, null, null, runId)
-                    "message" -> handleMessage(raw, config, runId)
+            BufferedReader(InputStreamReader(connection.inputStream, Charsets.UTF_8)).use { reader ->
+                while (isActive(runId)) {
+                    val line = reader.readLine() ?: break
+                    if (line.isBlank()) continue
+                    val raw = JSONObject(line)
+                    when (raw.optString("event")) {
+                        "open" -> {
+                            onConnected()
+                            emitStatus("connected", true, null, null, runId, "open")
+                        }
+                        "keepalive", "message" -> {
+                            // Record native I/O, not a JS timer or an old persisted
+                            // connected flag. Heartbeats need no notification update.
+                            if (isActive(runId)) store.saveStatus(
+                                statusJson("connected", running = true, connected = true)
+                                    .put("streamEvent", raw.optString("event")),
+                            )
+                            if (raw.optString("event") == "message") handleMessage(raw, config, runId)
+                        }
+                    }
                 }
             }
+        } finally {
+            // A retired worker owns this socket only, never its replacement.
+            synchronized(networkMonitor) {
+                if (activeConnection === connection) activeConnection = null
+            }
+            connection.disconnect()
         }
     }
 
@@ -207,11 +229,13 @@ class NtfyForegroundService : Service() {
         error: String?,
         retrySeconds: Int?,
         runId: Long,
+        streamEvent: String? = null,
     ) {
         if (!isActive(runId)) return
         val status = statusJson(state, running = true, connected = connected).apply {
             if (error == null) remove("lastError") else put("lastError", error)
             if (retrySeconds == null) remove("retryInSeconds") else put("retryInSeconds", retrySeconds)
+            if (streamEvent != null) put("streamEvent", streamEvent)
         }
         store.saveStatus(status)
         NtfyEventBus.statusChanged(status)
@@ -232,6 +256,7 @@ class NtfyForegroundService : Service() {
             put("state", state)
             put("running", running)
             put("connected", connected)
+            put("observedAt", System.currentTimeMillis())
             if (config != null) {
                 put("baseUrl", config.baseUrl)
                 put("topics", org.json.JSONArray(config.topics))
@@ -292,7 +317,9 @@ class NtfyForegroundService : Service() {
             .setContentTitle(message.optString("title").ifBlank { message.optString("topic", "ntfy") })
             .setContentText(message.optString("message"))
             .setStyle(NotificationCompat.BigTextStyle().bigText(message.optString("message")))
-            .setContentIntent(appPendingIntent(id))
+            .setContentIntent(appPendingIntent(id, NtfyNotificationTap.uri(
+                config.signature, message.optString("topic"), message.optString("id"),
+            )))
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             .setPriority(profile.compatPriority)
             .setAutoCancel(true)
@@ -303,9 +330,12 @@ class NtfyForegroundService : Service() {
     private fun notificationIcon(): Int = applicationInfo.icon.takeIf { it != 0 }
         ?: android.R.drawable.stat_notify_sync_noanim
 
-    private fun appPendingIntent(requestCode: Int): PendingIntent? {
+    private fun appPendingIntent(requestCode: Int, tapUri: String? = null): PendingIntent? {
         val launchIntent = packageManager.getLaunchIntentForPackage(packageName)?.apply {
             addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            // Distinct data also prevents colliding integer request codes from
+            // replacing another message's PendingIntent. Always open our app.
+            if (tapUri != null) data = Uri.parse(tapUri)
         } ?: return null
         return PendingIntent.getActivity(
             this,

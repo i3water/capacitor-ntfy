@@ -31,11 +31,44 @@ import org.json.JSONObject
 class NtfyPlugin : Plugin(), NtfyEventListener {
     private lateinit var store: NtfyStore
     private val ioExecutor = Executors.newCachedThreadPool()
+    private val notificationTap = NtfyNotificationTap()
 
     override fun load() {
         store = NtfyStore(context)
         reconcilePreviousExit()
         NtfyEventBus.add(this)
+        captureNotificationTap(activity?.intent)
+    }
+
+    override fun handleOnNewIntent(intent: Intent?) {
+        super.handleOnNewIntent(intent)
+        captureNotificationTap(intent)
+    }
+
+    private fun captureNotificationTap(intent: Intent?) {
+        if (!notificationTap.capture(intent?.dataString)) return
+        intent?.data = null // Activity recreation must not replay a consumed tap.
+        notifyListeners("notificationAction", JSObject())
+    }
+
+    @PluginMethod
+    fun consumeNotificationAction(call: PluginCall) {
+        val reference = notificationTap.take()
+        val config = store.loadConfig()
+        val result = JSObject()
+        if (reference != null && config != null && store.isEnabled()) {
+            val history = store.getMessages(500)
+            for (index in 0 until history.length()) {
+                val message = history.optJSONObject(index) ?: continue
+                val topic = message.optString("topic")
+                if (message.optString("event") == "message" && config.topics.contains(topic)
+                    && reference == NtfyNotificationTap.uri(config.signature, topic, message.optString("id"))) {
+                    result.put("message", toJSObject(message))
+                    break
+                }
+            }
+        }
+        call.resolve(result)
     }
 
     override fun handleOnDestroy() {
@@ -73,6 +106,7 @@ class NtfyPlugin : Plugin(), NtfyEventListener {
 
     @PluginMethod
     fun stop(call: PluginCall) {
+        notificationTap.clear()
         store.setEnabled(false)
         ntfyServiceRuntime.markStopped()
         context.stopService(Intent(context, NtfyForegroundService::class.java))
@@ -101,6 +135,7 @@ class NtfyPlugin : Plugin(), NtfyEventListener {
 
     @PluginMethod
     fun clearMessages(call: PluginCall) {
+        notificationTap.clear()
         store.clearMessages()
         call.resolve()
     }

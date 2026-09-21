@@ -36,6 +36,10 @@ export interface NtfyStatus {
   state: NtfyConnectionState;
   running: boolean;
   connected: boolean;
+  /** Android: Unix milliseconds of the native state/stream observation, not delivery proof. */
+  observedAt?: number;
+  /** Android: native stream activity that produced this snapshot. Cleared on reconnect/stop. */
+  streamEvent?: 'open' | 'keepalive' | 'message';
   baseUrl?: string;
   topics?: string[];
   lastMessageId?: string;
@@ -79,6 +83,11 @@ export interface NtfyPlugin {
   getStatus(): Promise<NtfyStatus>;
   getMessages(options?: { limit?: number }): Promise<{ messages: NtfyMessage[] }>;
   clearMessages(): Promise<void>;
+  /** Consume the latest native notification tap. No message after stop, eviction or configuration change.
+   * Call after registering notificationAction, and on each event, including at cold start.
+   * The app must authorize the current account and fetch current business details; never execute raw/click.
+   */
+  consumeNotificationAction(): Promise<{ message?: NtfyMessage }>;
   publish(options: NtfyPublishOptions): Promise<NtfyMessage>;
   requestNotificationPermission(): Promise<{ state: NtfyPermissionState }>;
   getNotificationPermission(): Promise<{ state: NtfyPermissionState }>;
@@ -90,5 +99,7 @@ export interface NtfyPlugin {
     listenerFunc: (message: NtfyMessage) => void,
   ): Promise<PluginListenerHandle>;
   addListener(eventName: 'statusChanged', listenerFunc: (status: NtfyStatus) => void): Promise<PluginListenerHandle>;
+  /** Signal only; consumeNotificationAction owns the single pending tap. Android only. */
+  addListener(eventName: 'notificationAction', listenerFunc: () => void): Promise<PluginListenerHandle>;
   removeAllListeners(): Promise<void>;
 }

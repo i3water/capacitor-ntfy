@@ -57,6 +57,10 @@ export class NtfyWeb extends WebPlugin implements NtfyPlugin {
     this.messages = [];
   }
 
+  async consumeNotificationAction(): Promise<{ message?: NtfyMessage }> {
+    return {}; // Native notification actions are not supported on Web.
+  }
+
   async publish(options: NtfyPublishOptions): Promise<NtfyMessage> {
     const response = await fetch(`${normalizeBaseUrl(options.baseUrl)}/${encodeURIComponent(options.topic)}`, {
       method: 'POST',

@@ -14,6 +14,9 @@ internal class NtfyServiceRuntimeTracker(
 
     @Synchronized
     fun markStarting() {
+        // startForegroundService can deliver onStartCommand to the same live
+        // Service without another onCreate. Do not downgrade that observation.
+        if (phase == Phase.RUNNING) return
         phase = Phase.STARTING
         startingAtMillis = nowMillis()
     }

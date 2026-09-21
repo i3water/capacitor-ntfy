@@ -12,7 +12,8 @@ internal class NtfyStore(context: Context) {
         val oldSignature = secureConfig.load()?.signature
         secureConfig.save(config)
         if (oldSignature != config.signature) {
-            preferences.edit().remove(KEY_LAST_ID).putString(KEY_SIGNATURE, config.signature).apply()
+            preferences.edit().remove(KEY_LAST_ID).remove(KEY_MESSAGES)
+                .putString(KEY_SIGNATURE, config.signature).apply()
         }
     }
 
