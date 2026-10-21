@@ -1,6 +1,6 @@
 # capacitor-ntfy
 
-Android-first Capacitor 8 plugin for receiving messages from a self-hosted or public ntfy server through a native foreground service. The connection continues when the WebView is suspended, received messages are retained locally, and native Android notifications can be shown immediately.
+Android-first Capacitor 8 plugin for receiving messages from a self-hosted or public ntfy server through a native foreground service. The connection does not depend on WebView timers; received messages are retained locally and can produce native Android notifications. Android or vendor process restrictions can still suspend or stop delivery.
 
 This project includes a complete demo application in [`demo/`](./demo/).
 
@@ -49,6 +49,16 @@ await Ntfy.addListener('statusChanged', (status) => {
 
 The plugin stores the active configuration so Android can restart the service. Tokens and passwords are encrypted with an AES-GCM key held by Android Keystore. Message history is stored in private application preferences and is capped by `historyLimit`.
 
+## Android notification taps
+
+Register `notificationAction`, then call `consumeNotificationAction()` once at startup and on each event. The event is only a wake-up signal; consumption returns `{ message }` for the latest tap, or `{}`. Only one pending tap is retained while the WebView starts, and each tap is consumed once. Stop, clear, history eviction and configuration changes invalidate old references. Configuration changes also clear subscription-scoped history.
+
+The immutable PendingIntent always opens the host app. It carries an opaque reference to local history, never credentials, a business command or an executable `click` URL. The plugin does not interpret account identities or sharing grants. The app must check its current account/subscription, validate the business message identifier, fetch authenticated current details, and ask the user to confirm any action. Received-message deduplication must not suppress a subsequent tap on the same message.
+
+Android warm taps and a real notification reopening the finished host Activity have been verified. This is not a process-death delivery guarantee. On one OPPO Android 16 test phone, the application UID was frozen despite an active foreground service; its native stream stopped until foreground interaction. Web returns an empty result; iOS remains unsupported.
+
+`NtfyStatus.observedAt` is the Android native observation time in Unix milliseconds. `streamEvent` identifies an actual `open`, `keepalive` or `message`; reconnect snapshots omit it. HTTP headers alone no longer report a connected stream. Heartbeats update the stored snapshot without reposting notifications or generating repeated JS status events. These are observations, not a delivery receipt or a guarantee of current activity: a frozen process cannot refresh them. The timestamp is diagnostic only, never an authorization clock.
+
 ## Sending a message
 
 Use your backend in production. The `publish` method is included for diagnostics and the demo:
@@ -70,6 +80,7 @@ Do not place a privileged server token in client code. Give each device narrowly
 - Ask the user to set the app battery mode to unrestricted if instant delivery is a core feature. `openBatteryOptimizationSettings()` opens the standard Android list.
 - Some Android variants also require the user to enable auto-start. This is outside the standard Android API and is not automated by this plugin.
 - `START_STICKY` and a boot receiver help recover the service, but user force-stop always wins.
+- Do not fight process restrictions with hidden restarts, fake foreground work, or WebView keepalive timers. Native foreground service presence alone does not prove that threads can run. Backend acceptance is not a phone receipt; retain authoritative business messages separately so foreground refresh can recover missed reminders.
 - The last received ntfy message ID is reused as `since` after reconnect, and message IDs are deduplicated locally.
 - Use HTTPS. Plain HTTP may require a host application network-security configuration and is unsuitable for credentials.
 - Android 14+ declares the foreground service as `specialUse`. App-store policy review may require explaining why continuous, user-visible notification delivery is the app's core function.
@@ -107,6 +118,7 @@ The Android plugin namespace is `io.github.coloz.capacitor.ntfy`, and the Demo a
 * [`getStatus()`](#getstatus)
 * [`getMessages(...)`](#getmessages)
 * [`clearMessages()`](#clearmessages)
+* [`consumeNotificationAction()`](#consumenotificationaction)
 * [`publish(...)`](#publish)
 * [`requestNotificationPermission()`](#requestnotificationpermission)
 * [`getNotificationPermission()`](#getnotificationpermission)
@@ -115,6 +127,7 @@ The Android plugin namespace is `io.github.coloz.capacitor.ntfy`, and the Demo a
 * [`openAppSettings()`](#openappsettings)
 * [`addListener('messageReceived', ...)`](#addlistenermessagereceived-)
 * [`addListener('statusChanged', ...)`](#addlistenerstatuschanged-)
+* [`addListener('notificationAction', ...)`](#addlistenernotificationaction-)
 * [`removeAllListeners()`](#removealllisteners)
 * [Interfaces](#interfaces)
 * [Type Aliases](#type-aliases)
@@ -181,6 +194,21 @@ getMessages(options?: { limit?: number | undefined; } | undefined) => Promise<{ 
 ```typescript
 clearMessages() => Promise<void>
 ```
+
+--------------------
+
+
+### consumeNotificationAction()
+
+```typescript
+consumeNotificationAction() => Promise<{ message?: NtfyMessage; }>
+```
+
+Consume the latest native notification tap. No message after stop, eviction or configuration change.
+Call after registering notificationAction, and on each event, including at cold start.
+The app must authorize the current account and fetch current business details; never execute raw/click.
+
+**Returns:** <code>Promise&lt;{ message?: <a href="#ntfymessage">NtfyMessage</a>; }&gt;</code>
 
 --------------------
 
@@ -283,6 +311,24 @@ addListener(eventName: 'statusChanged', listenerFunc: (status: NtfyStatus) => vo
 --------------------
 
 
+### addListener('notificationAction', ...)
+
+```typescript
+addListener(eventName: 'notificationAction', listenerFunc: () => void) => Promise<PluginListenerHandle>
+```
+
+Signal only; consumeNotificationAction owns the single pending tap. Android only.
+
+| Param              | Type                              |
+| ------------------ | --------------------------------- |
+| **`eventName`**    | <code>'notificationAction'</code> |
+| **`listenerFunc`** | <code>() =&gt; void</code>        |
+
+**Returns:** <code>Promise&lt;<a href="#pluginlistenerhandle">PluginListenerHandle</a>&gt;</code>
+
+--------------------
+
+
 ### removeAllListeners()
 
 ```typescript
@@ -297,18 +343,20 @@ removeAllListeners() => Promise<void>
 
 #### NtfyStatus
 
-| Prop                              | Type                                                                |
-| --------------------------------- | ------------------------------------------------------------------- |
-| **`state`**                       | <code><a href="#ntfyconnectionstate">NtfyConnectionState</a></code> |
-| **`running`**                     | <code>boolean</code>                                                |
-| **`connected`**                   | <code>boolean</code>                                                |
-| **`baseUrl`**                     | <code>string</code>                                                 |
-| **`topics`**                      | <code>string[]</code>                                               |
-| **`lastMessageId`**               | <code>string</code>                                                 |
-| **`lastError`**                   | <code>string</code>                                                 |
-| **`retryInSeconds`**              | <code>number</code>                                                 |
-| **`batteryOptimizationsIgnored`** | <code>boolean</code>                                                |
-| **`notificationPermission`**      | <code><a href="#ntfypermissionstate">NtfyPermissionState</a></code> |
+| Prop                              | Type                                                                | Description                                                                             |
+| --------------------------------- | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| **`state`**                       | <code><a href="#ntfyconnectionstate">NtfyConnectionState</a></code> |                                                                                         |
+| **`running`**                     | <code>boolean</code>                                                |                                                                                         |
+| **`connected`**                   | <code>boolean</code>                                                |                                                                                         |
+| **`observedAt`**                  | <code>number</code>                                                 | Android: Unix milliseconds of the native state/stream observation, not delivery proof.  |
+| **`streamEvent`**                 | <code>'message' \| 'open' \| 'keepalive'</code>                     | Android: native stream activity that produced this snapshot. Cleared on reconnect/stop. |
+| **`baseUrl`**                     | <code>string</code>                                                 |                                                                                         |
+| **`topics`**                      | <code>string[]</code>                                               |                                                                                         |
+| **`lastMessageId`**               | <code>string</code>                                                 |                                                                                         |
+| **`lastError`**                   | <code>string</code>                                                 |                                                                                         |
+| **`retryInSeconds`**              | <code>number</code>                                                 |                                                                                         |
+| **`batteryOptimizationsIgnored`** | <code>boolean</code>                                                |                                                                                         |
+| **`notificationPermission`**      | <code><a href="#ntfypermissionstate">NtfyPermissionState</a></code> |                                                                                         |
 
 
 #### NtfyStartOptions
